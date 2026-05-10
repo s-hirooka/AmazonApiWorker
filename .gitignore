@@ -1,0 +1,9 @@
+bin/
+obj/
+database/
+logs/
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+WebView2Profile/
