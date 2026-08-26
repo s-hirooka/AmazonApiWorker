@@ -46,7 +46,7 @@ public sealed class AmazonCreatorsApiClient : IDisposable
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://creatorsapi.amazon/catalog/v1/getItems");
         request.Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json");
-        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {token}, Version {_version}");
+        request.Headers.TryAddWithoutValidation("Authorization", IsVersion3() ? $"Bearer {token}" : $"Bearer {token}, Version {_version}");
         request.Headers.TryAddWithoutValidation("x-marketplace", _marketplace);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
@@ -75,13 +75,20 @@ public sealed class AmazonCreatorsApiClient : IDisposable
             return _accessToken;
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, "https://creatorsapi.auth.us-west-2.amazoncognito.com/oauth2/token");
-        string basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_credentialId}:{_credentialSecret}"));
-        request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basic);
-        request.Content = new StringContent(
-            "grant_type=client_credentials&scope=creatorsapi/default",
-            Encoding.UTF8,
-            "application/x-www-form-urlencoded");
+        bool isVersion3 = IsVersion3();
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            isVersion3 ? GetLwaTokenEndpoint() : "https://creatorsapi.auth.us-west-2.amazoncognito.com/oauth2/token");
+
+        string scope = isVersion3 ? "creatorsapi::default" : "creatorsapi/default";
+        string content = $"grant_type=client_credentials&client_id={Uri.EscapeDataString(_credentialId)}&client_secret={Uri.EscapeDataString(_credentialSecret)}&scope={Uri.EscapeDataString(scope)}";
+        request.Content = new StringContent(content, Encoding.UTF8, "application/x-www-form-urlencoded");
+
+        if (!isVersion3)
+        {
+            string basic = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_credentialId}:{_credentialSecret}"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basic);
+        }
 
         using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         string responseText = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
@@ -102,6 +109,27 @@ public sealed class AmazonCreatorsApiClient : IDisposable
         _accessToken = token.AccessToken;
         _accessTokenExpiresAtUtc = DateTimeOffset.UtcNow.AddSeconds(token.ExpiresIn <= 0 ? 3600 : token.ExpiresIn);
         return _accessToken;
+    }
+
+    private bool IsVersion3()
+    {
+        return (_version ?? "").Trim().StartsWith("3.", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string GetLwaTokenEndpoint()
+    {
+        string version = (_version ?? "").Trim();
+        if (version.StartsWith("3.1", StringComparison.OrdinalIgnoreCase))
+        {
+            return "https://api.amazon.com/auth/o2/token";
+        }
+
+        if (version.StartsWith("3.2", StringComparison.OrdinalIgnoreCase))
+        {
+            return "https://api.amazon.co.uk/auth/o2/token";
+        }
+
+        return "https://api.amazon.co.jp/auth/o2/token";
     }
 
     public void Dispose()
