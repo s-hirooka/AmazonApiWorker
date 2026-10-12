@@ -31,8 +31,72 @@ public sealed class AmazonCreatorsApiClient : IDisposable
         _httpClient.Timeout = TimeSpan.FromSeconds(30);
     }
 
-    public async Task<(bool Success, string Url, string Error)> GetAffiliateLinkByAsinAsync(
+    // リンク作成に最低限必要な項目（従来から要求していたもの）
+    private static readonly string[] MinimalResources =
+    {
+        "itemInfo.title",
+        "images.primary.medium"
+    };
+
+    // 取得できる商品情報をすべて要求する。結果は twi-autoV2 へそのまま渡す。
+    private static readonly string[] FullResources =
+    {
+        "browseNodeInfo.browseNodes",
+        "browseNodeInfo.browseNodes.ancestor",
+        "browseNodeInfo.browseNodes.salesRank",
+        "browseNodeInfo.websiteSalesRank",
+        "customerReviews.count",
+        "customerReviews.starRating",
+        "images.primary.small",
+        "images.primary.medium",
+        "images.primary.large",
+        "images.variants.small",
+        "images.variants.medium",
+        "images.variants.large",
+        "itemInfo.byLineInfo",
+        "itemInfo.contentInfo",
+        "itemInfo.contentRating",
+        "itemInfo.classifications",
+        "itemInfo.externalIds",
+        "itemInfo.features",
+        "itemInfo.manufactureInfo",
+        "itemInfo.productInfo",
+        "itemInfo.technicalInfo",
+        "itemInfo.title",
+        "itemInfo.tradeInInfo",
+        "offersV2.listings.availability",
+        "offersV2.listings.condition",
+        "offersV2.listings.dealDetails",
+        "offersV2.listings.isBuyBoxWinner",
+        "offersV2.listings.loyaltyPoints",
+        "offersV2.listings.merchantInfo",
+        "offersV2.listings.price",
+        "offersV2.listings.type",
+        "parentASIN"
+    };
+
+    /// <summary>
+    /// ASIN からアフィリエイトリンクと商品情報を取得する。
+    /// ItemJson は API が返した商品1件分のJSON（取得できなかったときは空文字）。
+    /// 全項目の要求が失敗した場合は、従来と同じ最小限の項目で取り直す（リンク作成を止めないため）。
+    /// </summary>
+    public async Task<(bool Success, string Url, string Error, string ItemJson)> GetAffiliateLinkByAsinAsync(
         string asin,
+        CancellationToken cancellationToken)
+    {
+        var full = await GetItemAsync(asin, FullResources, cancellationToken).ConfigureAwait(false);
+        if (full.Success)
+        {
+            return full;
+        }
+
+        var minimal = await GetItemAsync(asin, MinimalResources, cancellationToken).ConfigureAwait(false);
+        return minimal.Success ? minimal : full;
+    }
+
+    private async Task<(bool Success, string Url, string Error, string ItemJson)> GetItemAsync(
+        string asin,
+        IEnumerable<string> resources,
         CancellationToken cancellationToken)
     {
         string token = await GetAccessTokenAsync(cancellationToken).ConfigureAwait(false);
@@ -41,7 +105,7 @@ public sealed class AmazonCreatorsApiClient : IDisposable
             ItemIds = new List<string> { asin },
             PartnerTag = _partnerTag,
             Marketplace = _marketplace,
-            Resources = new List<string> { "itemInfo.title", "images.primary.medium" }
+            Resources = resources.ToList()
         };
 
         using var request = new HttpRequestMessage(HttpMethod.Post, "https://creatorsapi.amazon/catalog/v1/getItems");
@@ -55,7 +119,7 @@ public sealed class AmazonCreatorsApiClient : IDisposable
 
         if (!response.IsSuccessStatusCode)
         {
-            return (false, "", $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {responseText}");
+            return (false, "", $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}: {responseText}", "");
         }
 
         var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
@@ -63,8 +127,29 @@ public sealed class AmazonCreatorsApiClient : IDisposable
         string url = apiResponse?.ItemsResult?.Items?.FirstOrDefault()?.DetailPageUrl ?? "";
 
         return string.IsNullOrWhiteSpace(url)
-            ? (false, "", "Creators API でURLを取得できませんでした。")
-            : (true, url, "");
+            ? (false, "", "Creators API でURLを取得できませんでした。", "")
+            : (true, url, "", ExtractFirstItemJson(responseText));
+    }
+
+    // 応答から商品1件分のJSONをそのまま取り出す。取り出せなくてもリンク作成は成功させる。
+    private static string ExtractFirstItemJson(string responseText)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(responseText);
+            if (document.RootElement.TryGetProperty("itemsResult", out JsonElement itemsResult)
+                && itemsResult.TryGetProperty("items", out JsonElement items)
+                && items.ValueKind == JsonValueKind.Array
+                && items.GetArrayLength() > 0)
+            {
+                return items[0].GetRawText();
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return "";
     }
 
     private async Task<string> GetAccessTokenAsync(CancellationToken cancellationToken)

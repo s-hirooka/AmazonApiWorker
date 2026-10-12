@@ -6,6 +6,7 @@ public partial class MainForm : Form
     private readonly CancellationTokenSource _cts = new();
     private readonly System.Windows.Forms.Timer _timer = new();
     private bool _processing;
+    private DateTime _nextResultJsonCleanupUtc = DateTime.MinValue;
 
     public MainForm()
     {
@@ -13,8 +14,13 @@ public partial class MainForm : Form
         ApplyAppIcon();
 
         _repository = new AmazonAffiliateQueueRepository(AmazonAffiliateQueueRepository.GetDefaultDbPath());
+        // 画面のタイトルとタスクトレイの表示にバージョンを出す（どの版が動いているか分かるように）
+        string version = typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "";
+        string title = string.IsNullOrEmpty(version) ? Text : $"{Text} Ver. {version}";
+        Text = title;
+
         notifyIcon1.Visible = true;
-        notifyIcon1.Text = "Amazon Affiliate Worker";
+        notifyIcon1.Text = title;
 
         _timer.Interval = 1000;
         _timer.Tick += async (_, _) => await ProcessNextAsync();
@@ -66,6 +72,7 @@ public partial class MainForm : Form
         var item = _repository.TryTakeNextPending();
         if (item == null)
         {
+            CleanupOldResultJsonIfDue();
             return;
         }
 
@@ -78,14 +85,14 @@ public partial class MainForm : Form
                 throw new InvalidOperationException("WebView2 mode is disabled. Use CreatorsApi mode.");
             }
 
-            string resultUrl = await CreateByCreatorsApiAsync(item);
+            var (resultUrl, resultJson) = await CreateByCreatorsApiAsync(item);
             if (string.IsNullOrWhiteSpace(resultUrl) || !resultUrl.Contains("http", StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("アフィリリンクを取得できませんでした。");
             }
 
-            _repository.MarkSuccess(item.Id, resultUrl);
-            AddLog($"成功: {resultUrl}");
+            _repository.MarkSuccess(item.Id, resultUrl, resultJson);
+            AddLog($"成功: {resultUrl}" + (string.IsNullOrEmpty(resultJson) ? "（商品情報なし）" : ""));
         }
         catch (Exception ex)
         {
@@ -98,7 +105,27 @@ public partial class MainForm : Form
         }
     }
 
-    private static async Task<string> CreateByCreatorsApiAsync(AmazonAffiliateQueueItem item)
+    // 待ち行列が空のときに、10分に1回だけ古い商品情報（JSON）を消す。
+    // twi-autoV2 は結果を数秒以内に読み取るので、1時間残せば十分。
+    private void CleanupOldResultJsonIfDue()
+    {
+        if (DateTime.UtcNow < _nextResultJsonCleanupUtc)
+        {
+            return;
+        }
+
+        _nextResultJsonCleanupUtc = DateTime.UtcNow.AddMinutes(10);
+        try
+        {
+            _repository.ClearOldResultJson(TimeSpan.FromHours(1));
+        }
+        catch (Exception ex)
+        {
+            AddLog("古い商品情報の削除に失敗: " + ex.Message);
+        }
+    }
+
+    private static async Task<(string Url, string ItemJson)> CreateByCreatorsApiAsync(AmazonAffiliateQueueItem item)
     {
         using var client = new AmazonCreatorsApiClient(
             item.CredentialId,
@@ -113,7 +140,7 @@ public partial class MainForm : Form
             throw new InvalidOperationException(result.Error);
         }
 
-        return result.Url;
+        return (result.Url, result.ItemJson);
     }
 
     private void AddLog(string message)

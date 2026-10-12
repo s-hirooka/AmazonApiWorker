@@ -67,6 +67,37 @@ CREATE INDEX IF NOT EXISTS IX_AmazonAffiliateQueue_Status_RequestedAt
 ON AmazonAffiliateQueue(Status, RequestedAt);
 ";
         cmd.ExecuteNonQuery();
+
+        EnsureResultJsonColumn(con);
+    }
+
+    // Creators API で取得した商品情報（JSON）を返すための列。
+    // 列の追加だけなので、この列を知らない旧バージョンの twi-autoV2 はこれまでどおり動く。
+    private static void EnsureResultJsonColumn(SqliteConnection con)
+    {
+        using (var check = con.CreateCommand())
+        {
+            check.CommandText = "PRAGMA table_info(AmazonAffiliateQueue);";
+            using var reader = check.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "ResultJson", StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+            }
+        }
+
+        try
+        {
+            using var alter = con.CreateCommand();
+            alter.CommandText = "ALTER TABLE AmazonAffiliateQueue ADD COLUMN ResultJson TEXT;";
+            alter.ExecuteNonQuery();
+        }
+        catch (SqliteException)
+        {
+            // twi-autoV2 側が同時に列を追加した場合など。列があれば問題ない。
+        }
     }
 
     public AmazonAffiliateQueueItem? TryTakeNextPending()
@@ -134,17 +165,17 @@ WHERE Id = @Id
         return item;
     }
 
-    public void MarkSuccess(long id, string resultUrl)
+    public void MarkSuccess(long id, string resultUrl, string resultJson)
     {
-        UpdateFinished(id, 2, resultUrl, "");
+        UpdateFinished(id, 2, resultUrl, "", resultJson);
     }
 
     public void MarkFailed(long id, string error)
     {
-        UpdateFinished(id, 3, "", error);
+        UpdateFinished(id, 3, "", error, "");
     }
 
-    private void UpdateFinished(long id, int status, string resultUrl, string error)
+    private void UpdateFinished(long id, int status, string resultUrl, string error, string resultJson)
     {
         using var con = Open();
         using var cmd = con.CreateCommand();
@@ -153,14 +184,35 @@ UPDATE AmazonAffiliateQueue
 SET Status = @Status,
     ResultUrl = @ResultUrl,
     ErrorMessage = @ErrorMessage,
+    ResultJson = @ResultJson,
     FinishedAt = @FinishedAt
 WHERE Id = @Id;";
         cmd.Parameters.AddWithValue("@Status", status);
         cmd.Parameters.AddWithValue("@ResultUrl", resultUrl ?? "");
         cmd.Parameters.AddWithValue("@ErrorMessage", error ?? "");
+        cmd.Parameters.AddWithValue("@ResultJson", resultJson ?? "");
         cmd.Parameters.AddWithValue("@FinishedAt", DateTime.UtcNow.ToString("o"));
         cmd.Parameters.AddWithValue("@Id", id);
         cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// 受け渡しが済んだ古い商品情報（JSON）を消す。
+    /// 1件あたり十数KBあり、残し続けるとキューDBが大きくなり続けるため。
+    /// 行そのものとリンク（ResultUrl）は残すので、従来の動作には影響しない。
+    /// </summary>
+    public int ClearOldResultJson(TimeSpan keep)
+    {
+        using var con = Open();
+        using var cmd = con.CreateCommand();
+        cmd.CommandText = @"
+UPDATE AmazonAffiliateQueue
+SET ResultJson = NULL
+WHERE Status IN (2, 3)
+  AND ResultJson IS NOT NULL
+  AND FinishedAt < @Cutoff;";
+        cmd.Parameters.AddWithValue("@Cutoff", DateTime.UtcNow.Subtract(keep).ToString("o"));
+        return cmd.ExecuteNonQuery();
     }
 
     private SqliteConnection Open()
